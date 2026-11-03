@@ -3,7 +3,7 @@
  *
  * The picture sits inside a conveyor belt that runs around it. Tapping a
  * collector (from the front of a deck lane or from the tray) puts it on the
- * belt. Every tick each collector on the belt looks straight into the
+ * belt; the belt carries a limited number of collectors at once. Every tick each collector on the belt looks straight into the
  * picture: if the first pixel in its line has the collector's colour, it
  * removes that pixel and uses one of its count.
  *
@@ -35,6 +35,8 @@ export interface GameState {
   lanes: Collector[][];
   tray: (Collector | null)[];
   belt: Rider[];
+  /** Maximum number of collectors on the belt at the same time. */
+  beltCapacity: number;
   status: Status;
   /** Why the game was lost, for the UI. */
   lostReason?: string;
@@ -98,17 +100,25 @@ export const exposedColors = (picture: number[][]): Set<number> => {
 
 export const isCleared = (picture: number[][]) => picture.every(row => row.every(v => v === EMPTY));
 
-export const createGame = (picture: number[][], lanes: Collector[][], traySize: number): GameState => ({
+export const createGame = (
+  picture: number[][],
+  lanes: Collector[][],
+  traySize: number,
+  beltCapacity: number,
+): GameState => ({
   picture: picture.map(row => [...row]),
   lanes: lanes.map(lane => lane.map(c => ({ ...c }))),
   tray: Array(traySize).fill(null),
   belt: [],
+  beltCapacity,
   status: 'playing',
 });
 
-/** A new collector can only enter when the entry spot is free. */
+/** A new collector can enter while the belt has room and the entry spot is free. */
 export const canLaunch = (state: GameState) =>
-  state.status === 'playing' && !state.belt.some(r => r.pos === 0);
+  state.status === 'playing' &&
+  state.belt.length < state.beltCapacity &&
+  !state.belt.some(r => r.pos === 0);
 
 export type LaunchSource = { from: 'lane'; index: number } | { from: 'tray'; index: number };
 

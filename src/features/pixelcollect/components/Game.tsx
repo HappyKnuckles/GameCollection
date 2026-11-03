@@ -7,7 +7,7 @@ import {
   ScrollView,
   Dimensions,
 } from 'react-native';
-import { Collector, EMPTY, GameState, LaunchSource, beltSpot, perimeter } from '../utils/engine';
+import { Collector, EMPTY, GameState, LaunchSource, beltSpot } from '../utils/engine';
 
 interface GameProps {
   title: string;
@@ -133,7 +133,6 @@ const PixelCollectGame: React.FC<GameProps> = ({
     }
   };
   const entry = spotCenter(0);
-  const lap = perimeter(rows, cols);
 
   const isHinted = (c: Collector | null | undefined) => !!c && c.id === hint;
 
@@ -209,7 +208,9 @@ const PixelCollectGame: React.FC<GameProps> = ({
         </View>
         <Text style={styles.beltInfo}>
           {state.belt.length > 0
-            ? `${state.belt.length} on the belt · lap = ${lap} steps`
+            ? `${state.belt.length}/${state.beltCapacity} on the belt${
+                state.belt.length >= state.beltCapacity ? ' · full' : ''
+              }`
             : 'Tap a collector to send it around the picture'}
         </Text>
 

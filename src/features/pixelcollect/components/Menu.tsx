@@ -1,36 +1,37 @@
 import React from 'react';
 import GameMenu, { DifficultyItem } from '../../../components/Menu';
-import { PICTURES, PictureDef } from '../constants/pictures';
-import { TRAY_SIZE } from '../constants/config';
+import { BELT_CAPACITY, PIXEL_DIFFICULTIES, PixelDifficulty, TRAY_SIZE } from '../constants/config';
 
 interface MenuProps {
-  onSelectPicture: (picture: PictureDef) => void;
-  selectedPicture: PictureDef;
+  onSelectDifficulty: (difficulty: PixelDifficulty) => void;
+  selectedDifficulty: PixelDifficulty;
 }
 
-const items: DifficultyItem[] = PICTURES.map(p => ({
-  id: p.id,
-  name: p.name,
-  description: `${p.art.length}×${p.art[0].length} · ${Object.keys(p.palette).length} colours`,
+const items: DifficultyItem[] = PIXEL_DIFFICULTIES.map(d => ({
+  id: d.id,
+  name: d.name,
+  description: `${d.size}×${d.size} · ${d.colors} colours`,
 }));
 
-const PixelCollectMenu: React.FC<MenuProps> = ({ onSelectPicture, selectedPicture }) => (
+const PixelCollectMenu: React.FC<MenuProps> = ({ onSelectDifficulty, selectedDifficulty }) => (
   <GameMenu
     title="🎨 Pixel Collect"
     subtitle="Clear the picture with colour collectors"
     difficulties={items}
-    selectedDifficulty={items.find(i => i.id === selectedPicture.id) ?? null}
+    selectedDifficulty={items.find(i => i.id === selectedDifficulty.id) ?? null}
     onSelectDifficulty={item => {
-      const picture = PICTURES.find(p => p.id === item.id);
-      if (picture) onSelectPicture(picture);
+      const difficulty = PIXEL_DIFFICULTIES.find(d => d.id === item.id);
+      if (difficulty) onSelectDifficulty(difficulty);
     }}
     rules={[
       'Tap a collector to send it around the picture on the belt.',
       'It removes the first pixel it sees in each row/column — only if that pixel is its colour.',
       'The number is how many pixels it can still collect.',
+      `At most ${BELT_CAPACITY} collectors fit on the belt at once.`,
       `After one lap, collectors with pixels left park in the tray (${TRAY_SIZE} slots). Tap them to send them again.`,
       'If a collector has to park and the tray is full, you lose.',
-      'Clear every pixel to win. Double-tap a picture to start.',
+      'Clear every pixel to win. Every game is a new picture — play as long as you like.',
+      'Double-tap a difficulty to start.',
     ]}
     maxWidth={350}
   />
