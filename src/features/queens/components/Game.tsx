@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useRef } from 'react';
 import {
   StyleSheet,
   Text,
@@ -46,14 +46,13 @@ const Game: React.FC<GameProps> = ({
   onGenerateHint,
   onReset,
 }) => {
-  const [lastDraggedCell, setLastDraggedCell] = useState<{
-    row: number;
-    col: number;
-  } | null>(null);
-
-  const hasDragged = useRef(false);
   const gridWrapperRef = useRef<View>(null);
-  const [gridOrigin, setGridOrigin] = useState({ x: 0, y: 0 });
+  // Page position of the grid. Kept in a ref and re-measured on layout,
+  // scroll and touch start, so it stays correct after the page scrolls.
+  const gridOrigin = useRef({ x: 0, y: 0 });
+  const startCell = useRef<{ row: number; col: number } | null>(null);
+  const lastDraggedCell = useRef<{ row: number; col: number } | null>(null);
+  const isDragging = useRef(false);
 
   const { width, height } = Dimensions.get('window');
   const GRID_BORDER_WIDTH = 2;
@@ -74,59 +73,59 @@ const Game: React.FC<GameProps> = ({
     return `${mins}:${secs}`;
   };
 
-  const onGridLayout = () => {
-    gridWrapperRef.current?.measure((x, y, width, height, pageX, pageY) => {
-      setGridOrigin({
+  const measureGrid = () => {
+    gridWrapperRef.current?.measure((_x, _y, _w, _h, pageX, pageY) => {
+      gridOrigin.current = {
         x: pageX + GRID_BORDER_WIDTH,
         y: pageY + GRID_BORDER_WIDTH,
-      });
+      };
     });
   };
 
   const getCellFromCoordinates = (event: GestureResponderEvent) => {
     const { pageX, pageY } = event.nativeEvent;
-    const locationX = pageX - gridOrigin.x;
-    const locationY = pageY - gridOrigin.y;
-    const col = Math.floor(locationX / cellSize);
-    const row = Math.floor(locationY / cellSize);
-    if (
-      row < 0 ||
-      row >= difficulty.size ||
-      col < 0 ||
-      col >= difficulty.size
-    ) {
+    const col = Math.floor((pageX - gridOrigin.current.x) / cellSize);
+    const row = Math.floor((pageY - gridOrigin.current.y) / cellSize);
+    if (row < 0 || row >= difficulty.size || col < 0 || col >= difficulty.size) {
       return null;
     }
     return { row, col };
   };
 
-  const handleTouchStart = () => {
-    hasDragged.current = false;
+  const endGesture = () => {
+    startCell.current = null;
+    lastDraggedCell.current = null;
+    isDragging.current = false;
+  };
+
+  const handleTouchStart = (event: GestureResponderEvent) => {
+    measureGrid();
+    isDragging.current = false;
+    startCell.current = getCellFromCoordinates(event);
+    lastDraggedCell.current = startCell.current;
   };
 
   const handleTouchMove = (event: GestureResponderEvent) => {
-    hasDragged.current = true;
     const cell = getCellFromCoordinates(event);
     if (!cell) return;
-    if (
-      lastDraggedCell &&
-      lastDraggedCell.row === cell.row &&
-      lastDraggedCell.col === cell.col
-    ) {
-      return;
+    const last = lastDraggedCell.current;
+    if (last && last.row === cell.row && last.col === cell.col) return;
+
+    // Only a move into another cell counts as a drag; small jitter inside
+    // the starting cell is still a tap. Dragging marks the start cell too.
+    if (!isDragging.current) {
+      isDragging.current = true;
+      if (startCell.current) onCellDragOver(startCell.current.row, startCell.current.col);
     }
     onCellDragOver(cell.row, cell.col);
-    setLastDraggedCell(cell);
+    lastDraggedCell.current = cell;
   };
 
-  const handleTouchEnd = (event: GestureResponderEvent) => {
-    if (!hasDragged.current) {
-      const cell = getCellFromCoordinates(event);
-      if (cell) {
-        onCellTap(cell.row, cell.col);
-      }
+  const handleTouchEnd = () => {
+    if (!isDragging.current && startCell.current) {
+      onCellTap(startCell.current.row, startCell.current.col);
     }
-    setLastDraggedCell(null);
+    endGesture();
   };
 
   const gridContainerProps = {
@@ -135,7 +134,11 @@ const Game: React.FC<GameProps> = ({
     onResponderGrant: handleTouchStart,
     onResponderMove: handleTouchMove,
     onResponderRelease: handleTouchEnd,
-    ...(Platform.OS === 'web' && { onMouseLeave: handleTouchEnd }),
+    // Keep the gesture while dragging instead of handing it to the ScrollView.
+    onResponderTerminationRequest: () => false,
+    onResponderTerminate: endGesture,
+    // Leaving the grid with the mouse ends a drag but never counts as a tap.
+    ...(Platform.OS === 'web' && { onMouseLeave: endGesture }),
   };
 
   return (
@@ -166,10 +169,14 @@ const Game: React.FC<GameProps> = ({
         </View>
       </View>
 
-      <ScrollView contentContainerStyle={styles.scrollContainer}>
+      <ScrollView
+        contentContainerStyle={styles.scrollContainer}
+        onScroll={measureGrid}
+        scrollEventThrottle={100}
+      >
         <View
           ref={gridWrapperRef}
-          onLayout={onGridLayout}
+          onLayout={measureGrid}
           style={[
             styles.gridBorderWrapper,
             {

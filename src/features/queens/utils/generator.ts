@@ -1,536 +1,269 @@
+import { SeededRNG } from '../../../utils/random';
+import { EMPTY, MARK, QUEEN, applyDeduction, buildUnits, findDeduction, solveLogically } from './solver';
+
 export interface PuzzleData {
+  /** Region index (0..size-1) of every cell. */
   colorGrid: number[][];
+  /** Starting board: 0 = empty, 1 = given ❌ (locked). */
   puzzleGrid: number[][];
+  /** 2 where the (unique) solution has a queen, 0 elsewhere. */
+  solutionGrid: number[][];
+  /** Seed the puzzle was generated from; the same seed reproduces it. */
   seed: number;
 }
 
-class SeededRNG {
-  private seed: number;
+/** One queen per row/column, no two touching. Returns the column of each row's queen. */
+const generateQueenColumns = (size: number, rng: SeededRNG): number[] | null => {
+  const cols: number[] = [];
+  const used = new Array(size).fill(false);
 
-  constructor(seed: number) {
-    this.seed = seed;
-  }
-
-  random(): number {
-    const x = Math.sin(this.seed++) * 10000;
-    return x - Math.floor(x);
-  }
-
-  randInt(min: number, max: number): number {
-    return Math.floor(this.random() * (max - min + 1)) + min;
-  }
-
-  shuffle<T>(array: T[]): T[] {
-    for (let i = array.length - 1; i > 0; i--) {
-      const j = Math.floor(this.random() * (i + 1));
-      [array[i], array[j]] = [array[j], array[i]];
-    }
-    return array;
-  }
-
-  getCurrentSeed(): number {
-    return this.seed;
-  }
-}
-
-
-const generateValidQueens = (size: number, rng: SeededRNG): [number, number][] | null => {
-  const queens: [number, number][] = [];
-
-  const isSafe = (row: number, col: number): boolean => {
-    for (const [qRow, qCol] of queens) {
-      if (qCol === col) return false;
-      if (Math.abs(qRow - row) <= 1 && Math.abs(qCol - col) <= 1) return false;
-    }
-    return true;
-  };
-
-  const solve = (row: number): boolean => {
+  const place = (row: number): boolean => {
     if (row === size) return true;
-
-    const columns = Array.from({ length: size }, (_, i) => i);
-    rng.shuffle(columns);
-
-    for (const col of columns) {
-      if (isSafe(row, col)) {
-        queens.push([row, col]);
-        if (solve(row + 1)) return true;
-        queens.pop();
-      }
+    const order = rng.shuffle(Array.from({ length: size }, (_, i) => i));
+    for (const col of order) {
+      if (used[col]) continue;
+      // Only the previous row can touch this one.
+      if (row > 0 && Math.abs(cols[row - 1] - col) <= 1) continue;
+      used[col] = true;
+      cols[row] = col;
+      if (place(row + 1)) return true;
+      used[col] = false;
     }
     return false;
   };
 
-  if (solve(0)) {
-    return queens;
-  }
-  return null;
+  return place(0) ? cols : null;
 };
 
-const solvePuzzleLogically = (
-  startGrid: number[][],
+/** Grows one contiguous region from every queen until the board is covered. */
+const growRegions = (size: number, queenCols: number[], rng: SeededRNG): number[][] => {
+  const grid: number[][] = Array.from({ length: size }, () => Array(size).fill(-1));
+  const frontier: [number, number][] = [];
+  const queued = new Set<number>();
+  const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+
+  const enqueueNeighbours = (r: number, c: number) => {
+    for (const [dr, dc] of dirs) {
+      const nr = r + dr;
+      const nc = c + dc;
+      if (nr < 0 || nr >= size || nc < 0 || nc >= size) continue;
+      if (grid[nr][nc] !== -1 || queued.has(nr * size + nc)) continue;
+      queued.add(nr * size + nc);
+      frontier.push([nr, nc]);
+    }
+  };
+
+  // Shuffle region ids so a region's colour doesn't reveal its queen's row.
+  const regionIds = rng.shuffle(Array.from({ length: size }, (_, i) => i));
+  queenCols.forEach((c, r) => {
+    grid[r][c] = regionIds[r];
+  });
+  queenCols.forEach((c, r) => enqueueNeighbours(r, c));
+
+  while (frontier.length > 0) {
+    const i = rng.randInt(0, frontier.length - 1);
+    const [r, c] = frontier[i];
+    frontier[i] = frontier[frontier.length - 1];
+    frontier.pop();
+
+    const neighbourColors: number[] = [];
+    for (const [dr, dc] of dirs) {
+      const nr = r + dr;
+      const nc = c + dc;
+      if (nr >= 0 && nr < size && nc >= 0 && nc < size && grid[nr][nc] !== -1)
+        neighbourColors.push(grid[nr][nc]);
+    }
+    grid[r][c] = rng.pick(neighbourColors);
+    enqueueNeighbours(r, c);
+  }
+  return grid;
+};
+
+/**
+ * Runs the logical solver and, whenever it gets stuck, adds a random ❌ clue
+ * (never on a solution cell) and continues. Returns the clue grid.
+ */
+const findClues = (
   colorGrid: number[][],
-): { grid: number[][]; queens: number; solvable: boolean } => {
-  const size = startGrid.length;
-  const grid = startGrid.map(row => [...row]);
-  let changed = true;
-  let queensPlaced = 0;
-  grid.forEach(row =>
-    row.forEach(cell => {
-      if (cell === 2) queensPlaced++;
-    }),
-  );
+  solutionGrid: number[][],
+  rng: SeededRNG,
+): number[][] | null => {
+  const size = colorGrid.length;
+  const units = buildUnits(colorGrid);
+  const clues: number[][] = Array.from({ length: size }, () => Array(size).fill(EMPTY));
+  const state = clues.map(row => [...row]);
 
-  const placeQueen = (r: number, c: number): boolean => {
-    if (grid[r][c] !== 0) return false;
-    grid[r][c] = 2;
-    queensPlaced++;
-    return true;
-  };
-
-  const findCombinations = <T>(array: T[], size: number): T[][] => {
-    const result: T[][] = [];
-    function combinationUtil(start: number, current: T[]) {
-      if (current.length === size) {
-        result.push([...current]);
-        return;
-      }
-      for (let i = start; i < array.length; i++) {
-        current.push(array[i]);
-        combinationUtil(i + 1, current);
-        current.pop();
-      }
+  for (;;) {
+    const d = findDeduction(state, colorGrid, units, true);
+    if (d === 'contradiction') return null; // cannot happen with sound deductions
+    if (d) {
+      applyDeduction(state, d);
+      continue;
     }
-    combinationUtil(0, []);
-    return result;
-  };
+    const queens = state.flat().filter(v => v === QUEEN).length;
+    if (queens === size) return clues;
 
-  while (changed) {
-    changed = false;
-    if (queensPlaced === size) break;
-
-    const queens: [number, number][] = [];
-    for (let r = 0; r < size; r++)
-      for (let c = 0; c < size; c++) if (grid[r][c] === 2) queens.push([r, c]);
-
-    for (const [qr, qc] of queens) {
-      const queenColor = colorGrid[qr][qc];
-      for (let i = 0; i < size; i++) {
-        for (let j = 0; j < size; j++) {
-          if (grid[i][j] === 0) {
-            const isAttacked =
-              i === qr ||
-              j === qc ||
-              (Math.abs(i - qr) <= 1 && Math.abs(j - qc) <= 1) ||
-              colorGrid[i][j] === queenColor;
-            if (isAttacked) {
-              grid[i][j] = 1;
-              changed = true;
-            }
-          }
-        }
-      }
-    }
-
-    for (let i = 0; i < size; i++) {
-      const checkConstraintForSingles = (cells: [number, number][]) => {
-        if (cells.some(([r, c]) => grid[r][c] === 2)) return;
-        const possibleSpots = cells.filter(([r, c]) => grid[r][c] === 0);
-
-        if (possibleSpots.length === 1) {
-          if (placeQueen(possibleSpots[0][0], possibleSpots[0][1]))
-            changed = true;
-          return;
-        }
-
-        const validCandidates: [number, number][] = [];
-        for (const [r, c] of possibleSpots) {
-          let isPossible = true;
-          for (const [qr, qc] of queens) {
-            if (
-              r === qr ||
-              c === qc ||
-              (Math.abs(r - qr) <= 1 && Math.abs(c - qc) <= 1) ||
-              colorGrid[r][c] === colorGrid[qr][qc]
-            ) {
-              isPossible = false;
-              break;
-            }
-          }
-          if (isPossible) {
-            validCandidates.push([r, c]);
-          }
-        }
-        if (validCandidates.length === 1) {
-          if (placeQueen(validCandidates[0][0], validCandidates[0][1]))
-            changed = true;
-        }
-      };
-
-      if (changed) continue;
-      checkConstraintForSingles(Array.from({ length: size }, (_, c) => [i, c]));
-      if (changed) continue;
-      checkConstraintForSingles(Array.from({ length: size }, (_, r) => [r, i]));
-
-      const colorCells: [number, number][] = [];
-      for (let r = 0; r < size; r++)
-        for (let c = 0; c < size; c++)
-          if (colorGrid[r][c] === i) colorCells.push([r, c]);
-      if (colorCells.length > 0) {
-        checkConstraintForSingles(colorCells);
-      }
-    }
-    if (changed) continue;
-
-    const colorCandidates: [number, number][][] = Array.from(
-      { length: size },
-      () => [],
-    );
+    const open: [number, number][] = [];
     for (let r = 0; r < size; r++)
       for (let c = 0; c < size; c++)
-        if (grid[r][c] === 0) colorCandidates[colorGrid[r][c]].push([r, c]);
-
-    for (let color = 0; color < size; color++) {
-      let hasQueen = false;
-      for (let r = 0; r < size; r++)
-        for (let c = 0; c < size; c++)
-          if (grid[r][c] === 2 && colorGrid[r][c] === color) hasQueen = true;
-      if (hasQueen) continue;
-      const candidates = colorCandidates[color];
-      if (candidates.length < 2) continue;
-
-      const uniqueRows = new Set(candidates.map(([r]) => r));
-      if (uniqueRows.size === 1) {
-        const row = uniqueRows.values().next().value;
-        for (let c = 0; c < size; c++) {
-          if (grid[row!][c] === 0 && colorGrid[row!][c] !== color) {
-            grid[row!][c] = 1;
-            changed = true;
-          }
-        }
-      }
-      const uniqueCols = new Set(candidates.map(([, c]) => c));
-      if (uniqueCols.size === 1) {
-        const col = uniqueCols.values().next().value;
-        for (let r = 0; r < size; r++) {
-          if (grid[r][col!] === 0 && colorGrid[r][col!] !== color) {
-            grid[r][col!] = 1;
-            changed = true;
-          }
-        }
-      }
-    }
-    if (changed) continue;
-
-    for (let color = 0; color < size; color++) {
-      let hasQueenInColor = false;
-      const colorCells: [number, number][] = [];
-      for (let r = 0; r < size; r++) {
-        for (let c = 0; c < size; c++) {
-          if (colorGrid[r][c] === color) {
-            colorCells.push([r, c]);
-            if (grid[r][c] === 2) {
-              hasQueenInColor = true;
-            }
-          }
-        }
-      }
-      if (hasQueenInColor || colorCells.length === 0) {
-        continue;
-      }
-      const uniqueRows = new Set(colorCells.map(([r]) => r));
-      const uniqueCols = new Set(colorCells.map(([, c]) => c));
-
-      if (uniqueRows.size === 1) {
-        const row = uniqueRows.values().next().value;
-        for (let c = 0; c < size; c++) {
-          if (colorGrid[row!][c] !== color && grid[row!][c] === 0) {
-            grid[row!][c] = 1;
-            changed = true;
-          }
-        }
-      }
-      if (uniqueCols.size === 1) {
-        const col = uniqueCols.values().next().value;
-        for (let r = 0; r < size; r++) {
-          if (colorGrid[r][col!] !== color && grid[r][col!] === 0) {
-            grid[r][col!] = 1;
-            changed = true;
-          }
-        }
-      }
-    }
-    if (changed) continue;
-
-    const availableColors = Array.from({ length: size }, (_, i) => i).filter(
-      color => !queens.some(([qr, qc]) => colorGrid[qr][qc] === color),
-    );
-    for (let N = 2; N <= 4; N++) {
-      if (availableColors.length < N) break;
-      const columnIndices = Array.from({ length: size }, (_, i) => i);
-      const columnCombinations = findCombinations(columnIndices, N);
-      for (const columnCombo of columnCombinations) {
-        const confinedColors: number[] = [];
-        for (const color of availableColors) {
-          const candidates = colorCandidates[color];
-          if (
-            candidates.length > 0 &&
-            candidates.every(([, c]) => columnCombo.includes(c))
-          ) {
-            confinedColors.push(color);
-          }
-        }
-        if (confinedColors.length === N) {
-          for (const col of columnCombo) {
-            for (let row = 0; row < size; row++) {
-              if (
-                grid[row][col] === 0 &&
-                !confinedColors.includes(colorGrid[row][col])
-              ) {
-                grid[row][col] = 1;
-                changed = true;
-              }
-            }
-          }
-        }
-      }
-      if (changed) break;
-      const rowIndices = Array.from({ length: size }, (_, i) => i);
-      const rowCombinations = findCombinations(rowIndices, N);
-      for (const rowCombo of rowCombinations) {
-        const confinedColors: number[] = [];
-        for (const color of availableColors) {
-          const candidates = colorCandidates[color];
-          if (
-            candidates.length > 0 &&
-            candidates.every(([r]) => rowCombo.includes(r))
-          ) {
-            confinedColors.push(color);
-          }
-        }
-        if (confinedColors.length === N) {
-          for (const row of rowCombo) {
-            for (let col = 0; col < size; col++) {
-              if (
-                grid[row][col] === 0 &&
-                !confinedColors.includes(colorGrid[row][col])
-              ) {
-                grid[row][col] = 1;
-                changed = true;
-              }
-            }
-          }
-        }
-      }
-      if (changed) break;
-    }
+        if (state[r][c] === EMPTY && solutionGrid[r][c] !== QUEEN) open.push([r, c]);
+    if (open.length === 0) return null;
+    const [r, c] = rng.pick(open);
+    clues[r][c] = MARK;
+    state[r][c] = MARK;
   }
-  return { grid, queens: queensPlaced, solvable: queensPlaced === size };
 };
 
-const generateSmallPuzzle = (
-  size: number,
-  rng: SeededRNG,
-): PuzzleData | null => {
+const countClues = (grid: number[][]) => grid.flat().filter(v => v === MARK).length;
 
-  let attempts = 0;
-  const MAX_TOTAL_ATTEMPTS = 500;
-
-  while (attempts < MAX_TOTAL_ATTEMPTS) {
-    attempts++;
-
-    const solutionQueens = generateValidQueens(size, rng);
-    if (!solutionQueens) continue;
-
-    const queensCoord: { [key: number]: number } = {};
-    for (const [r, c] of solutionQueens) {
-      queensCoord[r] = c;
-    }
-
-    const colorGrid: number[][] = Array.from({ length: size }, () =>
-      Array(size).fill(-1),
-    );
-
-    for (let i = 0; i < size; i++) {
-      for (let j = 0; j < size; j++) {
-        if (queensCoord[i] === j) {
-          colorGrid[i][j] = i;
-        }
-      }
-    }
-
-    const isElemInGrid = (val: number, grid: number[][]) =>
-      grid.some(row => row.includes(val));
-
-    const getValidColoredCells = () => {
-      const cells: [number, number, number][] = [];
-      for (let r = 0; r < size; r++) {
-        for (let c = 0; c < size; c++) {
-          if (colorGrid[r][c] !== -1) {
-            cells.push([r, c, colorGrid[r][c]]);
-          }
-        }
-      }
-      return cells;
-    };
-
-    let safetyLoop = 0;
-    let mapGenerationFailed = false;
-    while (isElemInGrid(-1, colorGrid)) {
-      safetyLoop++;
-      if (safetyLoop > 5000) {
-        mapGenerationFailed = true;
-        break;
-      }
-
-      const coloredCells = getValidColoredCells();
-      if (coloredCells.length === 0) break;
-
-      const [r, c, color] = coloredCells[rng.randInt(0, coloredCells.length - 1)];
-      const neighborhood: [number, number][] = [];
-      if (r > 0) neighborhood.push([r - 1, c]);
-      if (r < size - 1) neighborhood.push([r + 1, c]);
-      if (c > 0) neighborhood.push([r, c - 1]);
-      if (c < size - 1) neighborhood.push([r, c + 1]);
-
-      const uncoloredNeighborhood = neighborhood.filter(
-        ([nr, nc]) => colorGrid[nr][nc] === -1,
-      );
-
-      if (uncoloredNeighborhood.length > 0) {
-        const [chosenR, chosenC] = uncoloredNeighborhood[rng.randInt(0, uncoloredNeighborhood.length - 1)];
-        colorGrid[chosenR][chosenC] = color;
-      }
-    }
-
-    if (mapGenerationFailed) continue;
-
-    const testGrid = Array.from({ length: size }, () => Array(size).fill(0));
-    const result = solvePuzzleLogically(testGrid, colorGrid);
-
-    if (result.solvable) {
-      const puzzleGrid = Array.from({ length: size }, () => Array(size).fill(0));
-      return {
-        colorGrid,
-        puzzleGrid,
-        seed: rng.getCurrentSeed(),
-      };
-    }
-
+/** Removes every clue that isn't needed for a guess-free solve. */
+const minimizeClues = (clues: number[][], colorGrid: number[][], rng: SeededRNG) => {
+  const units = buildUnits(colorGrid);
+  const cells: [number, number][] = [];
+  clues.forEach((row, r) => row.forEach((v, c) => v === MARK && cells.push([r, c])));
+  for (const [r, c] of rng.shuffle(cells)) {
+    clues[r][c] = EMPTY;
+    if (!solveLogically(clues, colorGrid, units).solved) clues[r][c] = MARK;
   }
-
-  return null; 
 };
 
-const generateLargePuzzle = (
-  size: number,
+/**
+ * `removalRatio` is the share of non-queen cells that may be left without a
+ * ❌ clue (1 = no extra clues; 0.9 = at least 10% of the cells are given).
+ */
+const padClues = (
+  clues: number[][],
+  solutionGrid: number[][],
   removalRatio: number,
   rng: SeededRNG,
-): PuzzleData | null => {
-
-  const solutionQueens = generateValidQueens(size, rng);
-  if (!solutionQueens) return null;
-
-  let colorGrid: number[][] = [];
-  const createColorGrid = () => {
-    const grid = Array(size)
-      .fill(null)
-      .map(() => Array(size).fill(-1));
-
-    const frontier: [number, number][] = [];
-    solutionQueens.forEach(([r, c], index) => {
-      const color = index;
-      grid[r][c] = color;
-      const directions = [[-1, 0], [1, 0], [0, -1], [0, 1]];
-      for (const [dr, dc] of directions) {
-        const nr = r + dr;
-        const nc = c + dc;
-        if (nr >= 0 && nr < size && nc >= 0 && nc < size && grid[nr][nc] === -1) {
-          frontier.push([nr, nc]);
-        }
-      }
-    });
-
-    while (frontier.length > 0) {
-      const pickIndex = rng.randInt(0, frontier.length - 1);
-      const [r, c] = frontier[pickIndex];
-      frontier.splice(pickIndex, 1);
-
-      if (grid[r][c] !== -1) continue;
-
-      const neighborColors: number[] = [];
-      const directions = [[-1, 0], [1, 0], [0, -1], [0, 1]];
-      for (const [dr, dc] of directions) {
-        const nr = r + dr;
-        const nc = c + dc;
-        if (nr >= 0 && nr < size && nc >= 0 && nc < size && grid[nr][nc] !== -1) {
-          neighborColors.push(grid[nr][nc]);
-        }
-      }
-
-      if (neighborColors.length > 0) {
-        const chosenColor = neighborColors[rng.randInt(0, neighborColors.length - 1)];
-        grid[r][c] = chosenColor;
-
-        for (const [dr, dc] of directions) {
-          const nr = r + dr;
-          const nc = c + dc;
-          if (nr >= 0 && nr < size && nc >= 0 && nc < size && grid[nr][nc] === -1) {
-            if (!frontier.some(([fr, fc]) => fr === nr && fc === nc)) {
-              frontier.push([nr, nc]);
-            }
-          }
-        }
-      }
-    }
-    colorGrid = grid;
-  };
-
-  createColorGrid();
-
-  const puzzleGrid = Array(size)
-    .fill(null)
-    .map(() => Array(size).fill(1));
-  const solutionSet = new Set(solutionQueens.map(([r, c]) => `${r},${c}`));
-  const removableClues: [number, number][] = [];
-
+) => {
+  const size = clues.length;
+  const removable = size * size - size;
+  const minClues = removable - Math.floor(removable * removalRatio);
+  const free: [number, number][] = [];
   for (let r = 0; r < size; r++)
-    for (let c = 0; c < size; c++) {
-      if (solutionSet.has(`${r},${c}`)) {
-        puzzleGrid[r][c] = 0;
-      } else {
-        removableClues.push([r, c]);
-      }
-    }
-  rng.shuffle(removableClues);
-
-  const cluesToRemoveCount = Math.floor(removableClues.length * removalRatio);
-  let removedCount = 0;
-
-  for (const [r, c] of removableClues) {
-    if (removedCount >= cluesToRemoveCount) break;
-    puzzleGrid[r][c] = 0;
-    const result = solvePuzzleLogically(puzzleGrid, colorGrid);
-    if (!result.solvable) {
-      puzzleGrid[r][c] = 1;
-    } else {
-      removedCount++;
-    }
+    for (let c = 0; c < size; c++)
+      if (clues[r][c] === EMPTY && solutionGrid[r][c] !== QUEEN) free.push([r, c]);
+  rng.shuffle(free);
+  let count = countClues(clues);
+  while (count < minClues && free.length > 0) {
+    const [r, c] = free.pop()!;
+    clues[r][c] = MARK;
+    count++;
   }
-
-  return { colorGrid, puzzleGrid, seed: rng.getCurrentSeed() };
 };
 
+const DIRS = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+
+const isRegionContiguous = (grid: number[][], color: number, start: [number, number]) => {
+  const size = grid.length;
+  let total = 0;
+  grid.forEach(row => row.forEach(v => v === color && total++));
+  const seen = new Set([start[0] * size + start[1]]);
+  const stack = [start];
+  while (stack.length) {
+    const [r, c] = stack.pop()!;
+    for (const [dr, dc] of DIRS) {
+      const nr = r + dr;
+      const nc = c + dc;
+      if (nr < 0 || nr >= size || nc < 0 || nc >= size || grid[nr][nc] !== color) continue;
+      const key = nr * size + nc;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      stack.push([nr, nc]);
+    }
+  }
+  return seen.size === total;
+};
+
+/** Cells the logical solver can't decide on an empty board (none = clue-free puzzle). */
+const unresolvedCells = (colorGrid: number[][]): [number, number][] => {
+  const size = colorGrid.length;
+  const empty = Array.from({ length: size }, () => Array(size).fill(EMPTY));
+  const { grid } = solveLogically(empty, colorGrid);
+  const out: [number, number][] = [];
+  grid.forEach((row, r) => row.forEach((v, c) => v === EMPTY && out.push([r, c])));
+  return out;
+};
+
+/**
+ * Hill-climbs the region map towards one that is solvable without clues:
+ * repeatedly hands a cell (mostly one the solver is still unsure about) to
+ * a neighbouring region and keeps the change if the solver gets at least as
+ * far as before. Queens never move and regions stay contiguous, so the
+ * intended solution stays valid.
+ */
+const improveRegions = (
+  colorGrid: number[][],
+  queenCols: number[],
+  iterations: number,
+  rng: SeededRNG,
+): number[][] => {
+  const size = colorGrid.length;
+  let grid = colorGrid.map(row => [...row]);
+  let unresolved = unresolvedCells(grid);
+
+  for (let i = 0; i < iterations && unresolved.length > 0; i++) {
+    const [r, c] =
+      rng.random() < 0.7
+        ? rng.pick(unresolved)
+        : [rng.randInt(0, size - 1), rng.randInt(0, size - 1)];
+    if (queenCols[r] === c) continue;
+
+    const own = grid[r][c];
+    const neighbourColors = DIRS.map(([dr, dc]) => [r + dr, c + dc])
+      .filter(([nr, nc]) => nr >= 0 && nr < size && nc >= 0 && nc < size)
+      .map(([nr, nc]) => grid[nr][nc])
+      .filter(color => color !== own);
+    if (neighbourColors.length === 0) continue;
+
+    const candidate = grid.map(row => [...row]);
+    candidate[r][c] = rng.pick(neighbourColors);
+    const queenRow = queenCols.findIndex((qc, qr) => grid[qr][qc] === own);
+    if (!isRegionContiguous(candidate, own, [queenRow, queenCols[queenRow]])) continue;
+
+    const candidateUnresolved = unresolvedCells(candidate);
+    if (candidateUnresolved.length <= unresolved.length) {
+      grid = candidate;
+      unresolved = candidateUnresolved;
+    }
+  }
+  return grid;
+};
+
+/** Hill-climbing budget: cheap on small boards, bounded on big ones. */
+const improveIterations = (size: number) =>
+  size <= 6 ? 150 : size <= 12 ? 250 : 60;
+
+/**
+ * Generates a Queens puzzle with a unique solution that can be solved
+ * without guessing. Deterministic for a given seed.
+ */
 export const generatePuzzle = (
   size: number,
   removalRatio: number,
-  initialSeed: number,
+  seed: number,
 ): PuzzleData | null => {
-  const rng = new SeededRNG(initialSeed + Math.random() * 10000);
+  const rng = new SeededRNG(seed);
 
-  if (size < 10) {
-    return generateSmallPuzzle(size, rng);
-  } else {
-    return generateLargePuzzle(size, removalRatio, rng);
-  }
+  const queenCols = generateQueenColumns(size, rng);
+  if (!queenCols) return null; // no valid placement exists for this size (e.g. 2x2, 3x3)
+
+  const solutionGrid = Array.from({ length: size }, (_, r) =>
+    Array.from({ length: size }, (_, c) => (queenCols[r] === c ? QUEEN : EMPTY)),
+  );
+  const colorGrid = improveRegions(
+    growRegions(size, queenCols, rng),
+    queenCols,
+    improveIterations(size),
+    rng,
+  );
+
+  // Whatever is still ambiguous gets resolved with ❌ clues.
+  const clues = findClues(colorGrid, solutionGrid, rng);
+  if (!clues) return null;
+  minimizeClues(clues, colorGrid, rng);
+  padClues(clues, solutionGrid, removalRatio, rng);
+
+  return { colorGrid, puzzleGrid: clues, solutionGrid, seed };
 };
