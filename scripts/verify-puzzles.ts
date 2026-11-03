@@ -16,6 +16,16 @@ import { SUDOKU_DIFFICULTIES } from '../src/features/sudoku/constants/config';
 import { generateSudoku } from '../src/features/sudoku/utils/generator';
 import { findHint } from '../src/features/sudoku/utils/hints';
 import { applyDeduction, buildUnits, findDeduction } from '../src/features/queens/utils/solver';
+import { PICTURES, parsePicture } from '../src/features/pixelcollect/constants/pictures';
+import { TRAY_SIZE } from '../src/features/pixelcollect/constants/config';
+import { generateDeck } from '../src/features/pixelcollect/utils/generator';
+import {
+  GameState,
+  createGame,
+  launch,
+  suggestLaunch,
+  tick,
+} from '../src/features/pixelcollect/utils/engine';
 
 const runs = Number(process.argv[2]) || 10;
 let failures = 0;
@@ -267,6 +277,83 @@ for (const d of Object.values(SUDOKU_DIFFICULTIES)) {
   }
   console.log(
     `  ${d.name.padEnd(18)} runs=${runs} clues avg=${(clues / runs).toFixed(1)} range=${minClues}-${maxClues} avgMs=${Math.round(totalMs / runs)} worstMs=${worst}`,
+  );
+}
+
+// ---------------- Pixel Collect ----------------
+
+/** Runs the belt until it is empty or the game ends. */
+const runBelt = (state: GameState) => {
+  let guard = 0;
+  while (state.status === 'playing' && state.belt.length > 0 && guard++ < 100000) state = tick(state);
+  return state;
+};
+
+console.log('Pixel Collect');
+for (const def of PICTURES) {
+  const { grid } = parsePicture(def);
+  const pixels = grid.flat().length;
+  let hintWins = 0;
+  let randomEnds = 0;
+  for (let i = 0; i < runs; i++) {
+    const seed = 31 * i + 7;
+    const deck = generateDeck(grid, def.lanes, seed);
+    const all = deck.lanes.flat();
+    const total = all.reduce((sum, c) => sum + c.count, 0);
+    if (total !== pixels) fail(`${def.id} seed=${seed}: counts ${total} != pixels ${pixels}`);
+
+    // 1. The stored solution, one collector at a time, must clear the picture.
+    let state = createGame(grid, deck.lanes, TRAY_SIZE);
+    for (const id of deck.solution) {
+      const lane = state.lanes.findIndex(l => l[0]?.id === id);
+      if (lane === -1) {
+        fail(`${def.id} seed=${seed}: solution collector ${id} not at a lane front`);
+        break;
+      }
+      state = runBelt(launch(state, { from: 'lane', index: lane }));
+      if (state.tray.some(Boolean)) fail(`${def.id} seed=${seed}: solution needed the tray`);
+    }
+    if (state.status !== 'won') fail(`${def.id} seed=${seed}: solution ended as ${state.status}`);
+
+    // 2. Following hints only (one collector at a time).
+    state = createGame(grid, deck.lanes, TRAY_SIZE);
+    for (let step = 0; step < 500 && state.status === 'playing'; step++) {
+      const pick = suggestLaunch(state);
+      if (!pick) break;
+      const lane = state.lanes.findIndex(l => l[0]?.id === pick.id);
+      const slot = state.tray.findIndex(c => c?.id === pick.id);
+      state = runBelt(launch(state, lane !== -1 ? { from: 'lane', index: lane } : { from: 'tray', index: slot }));
+    }
+    if (state.status === 'won') hintWins++;
+    else fail(`${def.id} seed=${seed}: following hints did not win`);
+
+    // 3. Random play with several collectors on the belt must never break.
+    const rng = (() => {
+      let x = seed;
+      return () => ((x = (x * 1103515245 + 12345) % 2147483648) / 2147483648);
+    })();
+    state = createGame(grid, deck.lanes, TRAY_SIZE);
+    for (let step = 0; step < 20000 && state.status === 'playing'; step++) {
+      if (rng() < 0.08) {
+        const sources = [
+          ...state.lanes.map((l, index) => (l.length ? { from: 'lane' as const, index } : null)),
+          ...state.tray.map((c, index) => (c ? { from: 'tray' as const, index } : null)),
+        ].filter(Boolean) as { from: 'lane' | 'tray'; index: number }[];
+        if (sources.length) state = launch(state, sources[Math.floor(rng() * sources.length)]);
+      }
+      state = tick(state);
+      const left = state.picture.flat().filter(v => v !== -1).length;
+      const ammo = [...state.lanes.flat(), ...state.tray.filter(Boolean), ...state.belt.map(r => r.collector)]
+        .reduce((sum, c) => sum + (c ? c.count : 0), 0);
+      if (state.status === 'playing' && ammo !== left) {
+        fail(`${def.id} seed=${seed}: ammo ${ammo} != pixels left ${left}`);
+        break;
+      }
+    }
+    if (state.status !== 'playing') randomEnds++;
+  }
+  console.log(
+    `  ${def.name.padEnd(18)} runs=${runs} collectors=${generateDeck(grid, def.lanes, 7).lanes.flat().length} hintWins=${hintWins}/${runs} randomGamesEnded=${randomEnds}/${runs}`,
   );
 }
 
