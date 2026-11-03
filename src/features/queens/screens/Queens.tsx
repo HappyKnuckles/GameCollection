@@ -1,7 +1,6 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import {
   StyleSheet,
-  Alert,
   View,
   StatusBar,
   ActivityIndicator,
@@ -9,333 +8,215 @@ import {
   Dimensions,
 } from 'react-native';
 import { generatePuzzle, PuzzleData } from '../utils/generator';
+import { EMPTY, MARK, QUEEN, buildUnits, findDeduction, Cell } from '../utils/solver';
 import Game from '../components/Game';
-import { DIFFICULTIES, QueensDifficulty,  } from '../constants/config';
+import { DIFFICULTIES, QueensDifficulty } from '../constants/config';
 import QueensMenu from '../components/Menu';
+import { randomSeed } from '../../../utils/random';
+import { showAlert } from '../../../utils/alert';
+import { formatDuration, useGameTimer } from '../../../hooks/useGameTimer';
 
 type GameState = 'menu' | 'playing' | 'won';
 
+interface Hint {
+  message: string;
+  cells: Cell[];
+  /** The hint is done once every cell has this value (or any value if undefined). */
+  expect?: number;
+}
+
+const validate = (grid: number[][], colorGrid: number[][]): string[] => {
+  const errors = new Set<string>();
+  const queens: Cell[] = [];
+  grid.forEach((row, r) => row.forEach((v, c) => v === QUEEN && queens.push([r, c])));
+
+  for (let i = 0; i < queens.length; i++) {
+    for (let j = i + 1; j < queens.length; j++) {
+      const [r1, c1] = queens[i];
+      const [r2, c2] = queens[j];
+      if (r1 === r2) errors.add(`Row ${r1 + 1} has multiple queens.`);
+      if (c1 === c2) errors.add(`Column ${c1 + 1} has multiple queens.`);
+      if (Math.abs(r1 - r2) <= 1 && Math.abs(c1 - c2) <= 1)
+        errors.add(`Queens at (${r1 + 1},${c1 + 1}) and (${r2 + 1},${c2 + 1}) are adjacent.`);
+    }
+  }
+
+  const colorCounts = new Map<number, number>();
+  queens.forEach(([r, c]) => {
+    const color = colorGrid[r][c];
+    colorCounts.set(color, (colorCounts.get(color) ?? 0) + 1);
+  });
+  colorCounts.forEach(count => {
+    if (count > 1) errors.add(`A color region has ${count} queens.`);
+  });
+
+  return [...errors];
+};
+
 const QueensScreen: React.FC = () => {
   const [difficulty, setDifficulty] = useState<QueensDifficulty>(DIFFICULTIES.EASY);
+  const [puzzle, setPuzzle] = useState<PuzzleData | null>(null);
   const [grid, setGrid] = useState<number[][]>([]);
-  const [initialGrid, setInitialGrid] = useState<number[][]>([]);
-  const [colorGrid, setColorGrid] = useState<number[][]>([]);
   const [gameState, setGameState] = useState<GameState>('menu');
-  const [errors, setErrors] = useState<string[]>([]);
-  const [isSolved, setIsSolved] = useState(false);
   const [hintsUsed, setHintsUsed] = useState(0);
-  const [lastPressTime, setLastPressTime] = useState(0);
-  const [lastPressedDifficulty, setLastPressedDifficulty] =
-    useState<QueensDifficulty | null>(null);
-  const [hintMessage, setHintMessage] = useState('');
+  const [hint, setHint] = useState<Hint | null>(null);
   const [loading, setLoading] = useState(false);
-  const [highlightedCells, setHighlightedCells] = useState<[number, number][]>(
-    [],
+  const lastPress = useRef<{ id: string; time: number } | null>(null);
+
+  const { time, timeRef, resetTime } = useGameTimer(gameState === 'playing' && !loading);
+
+  const colorGrid = puzzle?.colorGrid ?? [];
+  const units = useMemo(() => (puzzle ? buildUnits(puzzle.colorGrid) : null), [puzzle]);
+  const errors = useMemo(
+    () => (puzzle ? validate(grid, puzzle.colorGrid) : []),
+    [grid, puzzle],
   );
 
-  const [time, setTime] = useState(0);
-  const timerInterval = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const stopTimer = () => {
-    if (timerInterval.current) {
-      clearInterval(timerInterval.current);
-      timerInterval.current = null;
-    }
-  };
-
-  const startTimer = () => {
-    stopTimer();
-    timerInterval.current = setInterval(() => {
-      setTime(prev => prev + 1);
-    }, 1000);
-  };
-
-  useEffect(() => {
-    return () => stopTimer();
-  }, []);
-
-  const initializeGame = (diff: QueensDifficulty, newSeed?: number) => {
-    setLoading(true);
-    setTimeout(() => {
-      const initialSeed = newSeed !== undefined ? newSeed : Date.now();
-      const puzzleData: PuzzleData | null = generatePuzzle(
-        diff.size,
-        diff.removalRatio,
-        initialSeed,
-      );
-
-      if (!puzzleData) {
+  const initializeGame = useCallback(
+    (diff: QueensDifficulty) => {
+      setLoading(true);
+      // Let the loading indicator render before the (synchronous) generation.
+      setTimeout(() => {
+        const data = generatePuzzle(diff.size, diff.removalRatio, randomSeed());
+        if (!data) {
+          setLoading(false);
+          showAlert('Generation Failed', 'Could not create a puzzle.');
+          return;
+        }
+        setDifficulty(diff);
+        setPuzzle(data);
+        setGrid(data.puzzleGrid.map(row => [...row]));
+        setGameState('playing');
+        setHint(null);
+        setHintsUsed(0);
+        resetTime();
         setLoading(false);
-        Alert.alert('Generation Failed', 'Could not create a puzzle.', [
-          { text: 'OK' },
-        ]);
-        return;
-      }
+      }, 50);
+    },
+    [resetTime],
+  );
 
-      const { colorGrid: newColorGrid, puzzleGrid: newGrid } = puzzleData;
+  const handleShowMenu = useCallback(() => {
+    setGameState('menu');
+    resetTime();
+  }, [resetTime]);
 
-      setTime(0);
-      startTimer();
+  // Win check: only a board change can complete the puzzle.
+  useEffect(() => {
+    if (gameState !== 'playing' || !puzzle) return;
+    const queens = grid.flat().filter(v => v === QUEEN).length;
+    if (queens !== difficulty.size || errors.length > 0) return;
 
-      setHintMessage('');
-      setDifficulty(diff);
-      setGrid(newGrid);
-      setInitialGrid(newGrid);
-      setColorGrid(newColorGrid);
-      setGameState('playing');
-      setErrors([]);
-      setIsSolved(false);
-      setHintsUsed(0);
-      setHighlightedCells([]);
-      setLoading(false);
-    }, 50);
-  };
+    setGameState('won');
+    setHint(null);
+    const finalTime = formatDuration(timeRef.current);
+    const message =
+      hintsUsed > 0
+        ? `You won using ${hintsUsed} hint${hintsUsed > 1 ? 's' : ''}, taking ${finalTime}!`
+        : `Perfect! You won without hints, taking ${finalTime}!`;
+    showAlert('Congratulations!', message, [
+      { text: 'Play Again', onPress: () => initializeGame(difficulty) },
+      { text: 'Main Menu', onPress: handleShowMenu },
+    ]);
+  }, [grid]);
+
+  // Clear the hint once the player has acted on all highlighted cells.
+  useEffect(() => {
+    if (!hint || hint.cells.length === 0) return;
+    const done = hint.cells.every(([r, c]) =>
+      hint.expect === undefined ? grid[r][c] !== EMPTY : grid[r][c] === hint.expect,
+    );
+    if (done) setHint(null);
+  }, [grid, hint]);
 
   const handleDifficultyPress = (diff: QueensDifficulty) => {
-    const currentTime = Date.now();
-    const doublePressDelay = 300;
-    if (
-      lastPressedDifficulty?.size === diff.size &&
-      currentTime - lastPressTime < doublePressDelay
-    ) {
+    const now = Date.now();
+    if (lastPress.current?.id === diff.id && now - lastPress.current.time < 300) {
+      lastPress.current = null;
       initializeGame(diff);
     } else {
       setDifficulty(diff);
-      setLastPressTime(currentTime);
-      setLastPressedDifficulty(diff);
+      lastPress.current = { id: diff.id, time: now };
     }
   };
 
-  const validateGameState = (currentGrid: number[][]): boolean => {
-    const size = difficulty.size;
-    const newErrors: string[] = [];
-    const queens: [number, number][] = [];
-    for (let i = 0; i < size; i++)
-      for (let j = 0; j < size; j++)
-        if (currentGrid[i][j] === 2) queens.push([i, j]);
-
-    for (let i = 0; i < queens.length; i++) {
-      for (let j = i + 1; j < queens.length; j++) {
-        const [r1, c1] = queens[i];
-        const [r2, c2] = queens[j];
-        if (r1 === r2) newErrors.push(`Row ${r1 + 1} has multiple queens.`);
-        if (c1 === c2) newErrors.push(`Column ${c1 + 1} has multiple queens.`);
-        if (Math.abs(r1 - r2) <= 1 && Math.abs(c1 - c2) <= 1)
-          newErrors.push(
-            `Queens at (${r1 + 1},${c1 + 1}) and (${r2 + 1},${
-              c2 + 1
-            }) are adjacent.`,
-          );
-      }
-    }
-
-    const colorCounts: { [key: number]: number } = {};
-    queens.forEach(([r, c]) => {
-      const color = colorGrid[r][c];
-      colorCounts[color] = (colorCounts[color] || 0) + 1;
-    });
-    for (const color in colorCounts)
-      if (colorCounts[color] > 1)
-        newErrors.push(`A color region has ${colorCounts[color]} queens.`);
-
-    setErrors([...new Set(newErrors)]);
-    return newErrors.length === 0;
-  };
-
-  const checkWinCondition = (currentGrid: number[][]) => {
-    const size = difficulty.size;
-    const queenCount = currentGrid.flat().filter(cell => cell === 2).length;
-    if (queenCount === size && validateGameState(currentGrid)) {
-      stopTimer();
-
-      setIsSolved(true);
-      setGameState('won');
-
-      const formatTime = (seconds: number) => {
-        const mins = Math.floor(seconds / 60);
-        const secs = seconds % 60;
-        return `${mins}m ${secs}s`;
-      };
-      const finalTime = formatTime(time);
-
-      const message =
-        hintsUsed > 0
-          ? `You won using ${hintsUsed} hint${
-              hintsUsed > 1 ? 's' : ''
-            }, taking ${finalTime}!`
-          : `Perfect! You won without hints, taking ${finalTime}!`;
-
-      Alert.alert('Congratulations!', message, [
-        { text: 'Play Again', onPress: () => initializeGame(difficulty) },
-        { text: 'Main Menu', onPress: () => handleShowMenu() },
-      ]);
-    }
-  };
-
-  const checkAndClearHighlights = (currentGrid: number[][]) => {
-    if (highlightedCells.length === 0) {
-      return;
-    }
-
-    const allHighlightsFilled = highlightedCells.every(
-      ([r, c]) => currentGrid[r][c] !== 0,
-    );
-
-    if (allHighlightsFilled) {
-      setHighlightedCells([]);
-      setHintMessage('');
-    }
-  };
+  const isGiven = (row: number, col: number) => puzzle?.puzzleGrid[row][col] === MARK;
 
   const handleCellTap = (row: number, col: number) => {
-    if (gameState !== 'playing' || isSolved) return;
-    const newGrid = grid.map(gridRow => [...gridRow]);
-    newGrid[row][col] = (newGrid[row][col] + 1) % 3;
-    setGrid(newGrid);
-    setTimeout(() => {
-      checkAndClearHighlights(newGrid);
-      const isValid = validateGameState(newGrid);
-      if (isValid) checkWinCondition(newGrid);
-    }, 0);
+    if (gameState !== 'playing' || isGiven(row, col)) return;
+    setGrid(prev => {
+      const next = prev.map(r => [...r]);
+      next[row][col] = (next[row][col] + 1) % 3;
+      return next;
+    });
   };
 
   const handleCellDragOver = (row: number, col: number) => {
-    if (grid[row][col] === 0) {
-      const newGrid = grid.map(gridRow => [...gridRow]);
-      newGrid[row][col] = 1;
-      setGrid(newGrid);
-      checkAndClearHighlights(newGrid);
-    }
+    if (gameState !== 'playing') return;
+    // Functional update: several drag events can arrive before a re-render.
+    setGrid(prev => {
+      if (prev[row][col] !== EMPTY) return prev;
+      const next = prev.map(r => [...r]);
+      next[row][col] = MARK;
+      return next;
+    });
   };
 
   const generateHint = () => {
-    if (gameState !== 'playing' || isSolved) return;
+    if (gameState !== 'playing' || !puzzle || !units) return;
+    const { solutionGrid } = puzzle;
     const size = difficulty.size;
 
-    setHighlightedCells([]);
-    setHintMessage('');
-
-    const queens: [number, number][] = [];
-    for (let r = 0; r < size; r++) {
-      for (let c = 0; c < size; c++) {
-        if (grid[r][c] === 2) queens.push([r, c]);
-      }
-    }
-
-    if (queens.length > 0) {
-      for (const [qr, qc] of queens) {
-        const attackedCellsToHighlight: [number, number][] = [];
-        const queenColor = colorGrid[qr][qc];
-
-        for (let r = 0; r < size; r++) {
-          for (let c = 0; c < size; c++) {
-            if (grid[r][c] === 0) {
-              const isInRow = r === qr;
-              const isInCol = c === qc;
-              const isAdjacent = Math.abs(r - qr) <= 1 && Math.abs(c - qc) <= 1;
-              const isInColor = colorGrid[r][c] === queenColor;
-
-              if (isInRow || isInCol || isAdjacent || isInColor) {
-                attackedCellsToHighlight.push([r, c]);
-              }
-            }
-          }
-        }
-
-        if (attackedCellsToHighlight.length > 0) {
-          setHighlightedCells(attackedCellsToHighlight);
-          setHintsUsed(prev => prev + 1);
-          setHintMessage(
-            `A queen at (${qr + 1}, ${qc + 1}) attacks these empty squares.`,
-          );
-          return;
-        }
-      }
-    }
-
-    const checkConstraintForSingle = (
-      cells: [number, number][],
-      constraintName: string,
-    ): boolean => {
-      if (cells.some(([r, c]) => grid[r][c] === 2)) return false;
-
-      const possibleSpots: [number, number][] = [];
-      for (const [r, c] of cells) {
-        if (grid[r][c] === 0) {
-          let isSafe = true;
-          for (const [qr, qc] of queens) {
-            if (
-              r === qr ||
-              c === qc ||
-              (Math.abs(r - qr) <= 1 && Math.abs(c - qc) <= 1) ||
-              colorGrid[r][c] === colorGrid[qr][qc]
-            ) {
-              isSafe = false;
-              break;
-            }
-          }
-          if (isSafe) {
-            possibleSpots.push([r, c]);
-          }
-        }
-      }
-
-      if (possibleSpots.length === 1) {
-        const [r, c] = possibleSpots[0];
-        setHighlightedCells([[r, c]]);
-        setHintsUsed(prev => prev + 1);
-        setHintMessage(
-          `In the ${constraintName}, there is only one valid place for a queen.`,
-        );
-        return true;
-      }
-      return false;
+    const give = (h: Hint) => {
+      setHint(h);
+      setHintsUsed(prev => prev + 1);
     };
 
-    for (let i = 0; i < size; i++) {
-      if (
-        checkConstraintForSingle(
-          Array.from({ length: size }, (_, c) => [i, c]),
-          `Row ${i + 1}`,
-        )
-      )
-        return;
-      if (
-        checkConstraintForSingle(
-          Array.from({ length: size }, (_, r) => [r, i]),
-          `Column ${i + 1}`,
-        )
-      )
-        return;
-
-      const colorCells: [number, number][] = [];
-      for (let r = 0; r < size; r++)
-        for (let c = 0; c < size; c++)
-          if (colorGrid[r][c] === i) colorCells.push([r, c]);
-      if (colorCells.length > 0) {
-        if (checkConstraintForSingle(colorCells, `Color Region`)) return;
+    // 1. Point out mistakes first; logic hints are meaningless on a wrong board.
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        if (grid[r][c] === QUEEN && solutionGrid[r][c] !== QUEEN) {
+          return give({
+            message: `The queen at (${r + 1}, ${c + 1}) is not part of the solution.`,
+            cells: [[r, c]],
+            expect: EMPTY,
+          });
+        }
+        if (grid[r][c] === MARK && solutionGrid[r][c] === QUEEN) {
+          return give({
+            message: `(${r + 1}, ${c + 1}) is marked ❌, but a queen belongs there.`,
+            cells: [[r, c]],
+            expect: QUEEN,
+          });
+        }
       }
     }
 
-    Alert.alert(
-      'No Obvious Hints',
-      'There are no simple moves based on your current board. You may need to use more advanced logic or re-evaluate your queen placements.',
-    );
-  };
+    // 2. Next logical step from the player's current board.
+    const step = findDeduction(grid, puzzle.colorGrid, units);
+    if (step && step !== 'contradiction') {
+      return give({
+        message: step.reason,
+        cells: step.cells,
+        expect: step.kind === 'place' ? QUEEN : undefined,
+      });
+    }
 
-  const handleShowMenu = () => {
-    stopTimer();
-    setGameState('menu');
-    setTime(0);
+    // 3. Fallback (shouldn't be needed): reveal a queen.
+    for (let r = 0; r < size; r++) {
+      for (let c = 0; c < size; c++) {
+        if (solutionGrid[r][c] === QUEEN && grid[r][c] !== QUEEN) {
+          return give({ message: 'A queen belongs here.', cells: [[r, c]], expect: QUEEN });
+        }
+      }
+    }
   };
 
   const handleReset = () => {
-    if (!initialGrid.length) return;
-    setGrid(initialGrid);
-    setErrors([]);
-    setIsSolved(false);
-    setHighlightedCells([]);
-    setHintMessage('');
+    if (!puzzle) return;
+    setGrid(puzzle.puzzleGrid.map(row => [...row]));
+    setHint(null);
+    setGameState('playing');
   };
 
   const renderContent = () => {
@@ -348,7 +229,7 @@ const QueensScreen: React.FC = () => {
       );
     }
 
-    if (gameState === 'playing' || gameState === 'won') {
+    if ((gameState === 'playing' || gameState === 'won') && puzzle) {
       return (
         <Game
           difficulty={difficulty}
@@ -356,9 +237,9 @@ const QueensScreen: React.FC = () => {
           colorGrid={colorGrid}
           hintsUsed={hintsUsed}
           errors={errors}
-          isSolved={isSolved}
-          highlightedCells={highlightedCells}
-          hintMessage={hintMessage}
+          isSolved={gameState === 'won'}
+          highlightedCells={hint?.cells ?? []}
+          hintMessage={hint?.message ?? ''}
           time={time}
           onCellTap={handleCellTap}
           onCellDragOver={handleCellDragOver}
@@ -371,10 +252,7 @@ const QueensScreen: React.FC = () => {
     }
 
     return (
-      <QueensMenu
-        onSelectDifficulty={handleDifficultyPress}
-        selectedDifficulty={difficulty}
-      />
+      <QueensMenu onSelectDifficulty={handleDifficultyPress} selectedDifficulty={difficulty} />
     );
   };
 

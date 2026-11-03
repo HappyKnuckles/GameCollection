@@ -1,174 +1,163 @@
-import { SudokuDifficulty } from "../constants/config";
+import { SudokuDifficulty } from '../constants/config';
+import { SeededRNG, randomSeed } from '../../../utils/random';
 
 export interface SudokuData {
   initialGrid: number[][]; // Clues only (0 for empty)
-  solvedGrid: number[][];  // Full solution
+  solvedGrid: number[][]; // Full solution
   difficulty: SudokuDifficulty;
+  seed: number;
 }
 
 const BLANK = 0;
+const ALL = 0x3fe; // bits 1..9
 
-const isValid = (grid: number[][], row: number, col: number, num: number): boolean => {
-  // Check Row & Col
-  for (let x = 0; x < 9; x++) {
-    if (grid[row][x] === num) return false;
-    if (grid[x][col] === num) return false;
-  }
-  // Check 3x3 Box
-  const startRow = Math.floor(row / 3) * 3;
-  const startCol = Math.floor(col / 3) * 3;
-  for (let i = 0; i < 3; i++) {
-    for (let j = 0; j < 3; j++) {
-      if (grid[startRow + i][startCol + j] === num) return false;
-    }
-  }
-  return true;
+const boxOf = (r: number, c: number) => Math.floor(r / 3) * 3 + Math.floor(c / 3);
+
+const bitsToDigits = (mask: number): number[] => {
+  const out: number[] = [];
+  for (let d = 1; d <= 9; d++) if (mask & (1 << d)) out.push(d);
+  return out;
 };
 
-// Fills the diagonal 3x3 boxes first (independent of each other) to speed up solving
-const fillDiagonal = (grid: number[][]) => {
-  for (let i = 0; i < 9; i = i + 3) {
-    fillBox(grid, i, i);
+const popcount = (mask: number) => {
+  let n = 0;
+  while (mask) {
+    mask &= mask - 1;
+    n++;
   }
+  return n;
 };
 
-const fillBox = (grid: number[][], row: number, col: number) => {
-  let num: number;
-  for (let i = 0; i < 3; i++) {
-    for (let j = 0; j < 3; j++) {
-      do {
-        num = Math.floor(Math.random() * 9) + 1;
-      } while (!isSafeInBox(grid, row, col, num));
-      grid[row + i][col + j] = num;
-    }
-  }
-};
+/** Bitmask state of the digits used in every row, column and box. */
+class Board {
+  rows = new Array(9).fill(0);
+  cols = new Array(9).fill(0);
+  boxes = new Array(9).fill(0);
 
-const isSafeInBox = (grid: number[][], row: number, col: number, num: number) => {
-  const startRow = Math.floor(row / 3) * 3;
-  const startCol = Math.floor(col / 3) * 3;
-  for (let i = 0; i < 3; i++) {
-    for (let j = 0; j < 3; j++) {
-      if (grid[startRow + i][startCol + j] === num) return false;
-    }
+  constructor(public grid: number[][]) {
+    for (let r = 0; r < 9; r++)
+      for (let c = 0; c < 9; c++) if (grid[r][c] !== BLANK) this.set(r, c, grid[r][c]);
   }
-  return true;
-};
 
-const solveGrid = (grid: number[][]): boolean => {
-  for (let row = 0; row < 9; row++) {
-    for (let col = 0; col < 9; col++) {
-      if (grid[row][col] === BLANK) {
-        for (let num = 1; num <= 9; num++) {
-          if (isValid(grid, row, col, num)) {
-            grid[row][col] = num;
-            if (solveGrid(grid)) return true;
-            grid[row][col] = BLANK;
-          }
+  candidates(r: number, c: number) {
+    return ALL & ~(this.rows[r] | this.cols[c] | this.boxes[boxOf(r, c)]);
+  }
+
+  set(r: number, c: number, d: number) {
+    const bit = 1 << d;
+    this.grid[r][c] = d;
+    this.rows[r] |= bit;
+    this.cols[c] |= bit;
+    this.boxes[boxOf(r, c)] |= bit;
+  }
+
+  clear(r: number, c: number) {
+    const bit = ~(1 << this.grid[r][c]);
+    this.rows[r] &= bit;
+    this.cols[c] &= bit;
+    this.boxes[boxOf(r, c)] &= bit;
+    this.grid[r][c] = BLANK;
+  }
+
+  /** Empty cell with the fewest candidates, or null if the grid is full. */
+  mostConstrained(): { r: number; c: number; mask: number } | null {
+    let best: { r: number; c: number; mask: number } | null = null;
+    let bestCount = 10;
+    for (let r = 0; r < 9; r++) {
+      for (let c = 0; c < 9; c++) {
+        if (this.grid[r][c] !== BLANK) continue;
+        const mask = this.candidates(r, c);
+        const n = popcount(mask);
+        if (n < bestCount) {
+          best = { r, c, mask };
+          bestCount = n;
+          if (n <= 1) return best;
         }
-        return false;
       }
     }
+    return best;
   }
-  return true;
+}
+
+/** Builds a random, completely filled valid grid. */
+const generateSolvedGrid = (rng: SeededRNG): number[][] => {
+  const board = new Board(Array.from({ length: 9 }, () => Array(9).fill(BLANK)));
+  const fill = (): boolean => {
+    const cell = board.mostConstrained();
+    if (!cell) return true;
+    for (const d of rng.shuffle(bitsToDigits(cell.mask))) {
+      board.set(cell.r, cell.c, d);
+      if (fill()) return true;
+      board.clear(cell.r, cell.c);
+    }
+    return false;
+  };
+  fill();
+  return board.grid;
 };
 
-// Fast solver to check uniqueness. Breaks immediately if > 1 solution found.
-const countSolutions = (grid: number[][]): number => {
+/** Counts solutions, stopping as soon as `limit` is reached. */
+export const countSolutions = (grid: number[][], limit = 2): number => {
+  const board = new Board(grid.map(row => [...row]));
   let count = 0;
-
-  const solve = (g: number[][]): void => {
-    if (count > 1) return; // Optimization: Stop as soon as we know it's not unique
-
-    let row = -1;
-    let col = -1;
-    let isEmpty = false;
-
-    // Find first empty cell
-    for (let i = 0; i < 9; i++) {
-      for (let j = 0; j < 9; j++) {
-        if (g[i][j] === BLANK) {
-          row = i;
-          col = j;
-          isEmpty = true;
-          break;
-        }
-      }
-      if (isEmpty) break;
-    }
-
-    // If no empty cells, we found a solution
-    if (!isEmpty) {
+  const solve = () => {
+    const cell = board.mostConstrained();
+    if (!cell) {
       count++;
       return;
     }
-
-    for (let num = 1; num <= 9; num++) {
-      if (isValid(g, row, col, num)) {
-        g[row][col] = num;
-        solve(g);
-        g[row][col] = BLANK; // Backtrack
-      }
+    for (const d of bitsToDigits(cell.mask)) {
+      board.set(cell.r, cell.c, d);
+      solve();
+      board.clear(cell.r, cell.c);
+      if (count >= limit) return;
     }
   };
-
-  // Create a deep copy for the solver to mutate
-  const gridCopy = grid.map(row => [...row]);
-  solve(gridCopy);
+  solve();
   return count;
 };
 
-export const generateSudoku = (difficulty: SudokuDifficulty): SudokuData | null => {
-  // 1. Generate a valid, full board
-  // Optimization: Fill diagonal boxes first, then solve. This ensures better randomness and speed.
-  const baseGrid = Array.from({ length: 9 }, () => Array(9).fill(BLANK));
-  fillDiagonal(baseGrid);
-  solveGrid(baseGrid);
-
-  const solvedGrid = baseGrid.map(row => [...row]);
-
-  // 2. Prepare removal logic
-  // Create a list of all coordinates (0-80) and shuffle them.
-  // This ensures we try to remove EVERY cell exactly once in a random order.
-  let attempts = difficulty.removalCount;
-  const puzzleGrid = baseGrid.map(row => [...row]);
-
+/** One pass of removing clues in random order while the solution stays unique. */
+const carvePuzzle = (solved: number[][], target: number, rng: SeededRNG) => {
+  const puzzle = solved.map(row => [...row]);
   const positions: [number, number][] = [];
-  for (let r = 0; r < 9; r++) {
-    for (let c = 0; c < 9; c++) {
-      positions.push([r, c]);
-    }
+  for (let r = 0; r < 9; r++) for (let c = 0; c < 9; c++) positions.push([r, c]);
+  rng.shuffle(positions);
+
+  let removed = 0;
+  for (const [r, c] of positions) {
+    if (removed >= target) break;
+    const backup = puzzle[r][c];
+    puzzle[r][c] = BLANK;
+    if (countSolutions(puzzle) === 1) removed++;
+    else puzzle[r][c] = backup;
   }
+  return { puzzle, removed };
+};
 
-  // Shuffle positions
-  for (let i = positions.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [positions[i], positions[j]] = [positions[j], positions[i]];
-  }
+/**
+ * Removal passes to try before settling for the best one. A random puzzle
+ * usually becomes "minimal" (no clue can be removed) at ~55-58 removals, so
+ * the hardest levels need several tries to reach their target.
+ */
+const carveAttempts = (target: number) => (target > 58 ? 40 : 12);
 
-  // 3. Remove clues
-  // We iterate through our shuffled list. We don't rely on a "while loop with safety break".
-  for (const [row, col] of positions) {
-    if (attempts <= 0) break; // Reached target difficulty
+export const generateSudoku = (difficulty: SudokuDifficulty, seed: number = randomSeed()): SudokuData => {
+  const rng = new SeededRNG(seed);
+  const target = Math.min(difficulty.removalCount, 81 - 17); // 17 = fewest clues possible
 
-    const backup = puzzleGrid[row][col];
-    puzzleGrid[row][col] = BLANK;
-
-    // Check if the puzzle still has exactly one solution
-    const solutions = countSolutions(puzzleGrid);
-
-    if (solutions !== 1) {
-      // If removing this number makes it unsolvable or ambiguous, put it back
-      puzzleGrid[row][col] = backup;
-    } else {
-      // Valid removal
-      attempts--;
-    }
+  let best: { puzzle: number[][]; solved: number[][]; removed: number } | null = null;
+  for (let attempt = 0; attempt < carveAttempts(target); attempt++) {
+    const solved = generateSolvedGrid(rng);
+    const { puzzle, removed } = carvePuzzle(solved, target, rng);
+    if (!best || removed > best.removed) best = { puzzle, solved, removed };
+    if (removed >= target) break;
   }
 
   return {
-    initialGrid: puzzleGrid,
-    solvedGrid: solvedGrid,
+    initialGrid: best!.puzzle,
+    solvedGrid: best!.solved,
     difficulty,
+    seed,
   };
 };

@@ -1,14 +1,19 @@
 export interface QueensDifficulty {
-  id: string; // <--- Added this
+  id: string;
   size: number;
   name: string;
+  /**
+   * Share of non-queen cells that may start without a ❌ clue.
+   * 1 = only the clues needed for a guess-free solve; lower values add
+   * extra random ❌ clues (easier).
+   */
   removalRatio: number;
 }
 
 export const DIFFICULTIES: { [key: string]: QueensDifficulty } = {
   EASY: { id: 'easy', size: 4, name: 'Easy (4x4)', removalRatio: 1 },
   MEDIUM: { id: 'medium', size: 6, name: 'Medium (6x6)', removalRatio: 1 },
-  HARD: { id: 'hard', size: 8, name: 'Hard (8x8)', removalRatio: 0.9 },
+  HARD: { id: 'hard', size: 8, name: 'Hard (8x8)', removalRatio: 1 },
   EXPERT: { id: 'expert', size: 10, name: 'Expert (10x10)', removalRatio: 0.93 },
   MASTER: { id: 'master', size: 12, name: 'Master (12x12)', removalRatio: 0.95 },
   HARDCORE: { id: 'hardcore', size: 20, name: 'Hardcore (20x20)', removalRatio: 0.96 },
